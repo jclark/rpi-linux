@@ -23,6 +23,7 @@
 #include <linux/iopoll.h>
 #include <linux/ip.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/netdevice.h>
@@ -416,10 +417,12 @@ mdio_pm_exit:
 	return status;
 }
 
-static int macb_mdio_write_c22(struct mii_bus *bus, int mii_id, int regnum,
-			       u16 value)
+static int macb_mdio_write_c22_sts(struct mii_bus *bus, int mii_id, int regnum,
+				   u16 value, struct ptp_system_timestamp *sts)
 {
 	struct macb *bp = bus->priv;
+	unsigned long flags = 0;
+	u32 cmd;
 	int status;
 
 	status = pm_runtime_resume_and_get(&bp->pdev->dev);
@@ -430,12 +433,29 @@ static int macb_mdio_write_c22(struct mii_bus *bus, int mii_id, int regnum,
 	if (status < 0)
 		goto mdio_write_exit;
 
-	macb_writel(bp, MAN, (MACB_BF(SOF, MACB_MAN_C22_SOF)
-			      | MACB_BF(RW, MACB_MAN_C22_WRITE)
-			      | MACB_BF(PHYA, mii_id)
-			      | MACB_BF(REGA, regnum)
-			      | MACB_BF(CODE, MACB_MAN_C22_CODE)
-			      | MACB_BF(DATA, value)));
+	cmd = MACB_BF(SOF, MACB_MAN_C22_SOF) |
+	      MACB_BF(RW, MACB_MAN_C22_WRITE) |
+	      MACB_BF(PHYA, mii_id) | MACB_BF(REGA, regnum) |
+	      MACB_BF(CODE, MACB_MAN_C22_CODE) | MACB_BF(DATA, value);
+
+	if (sts) {
+		local_irq_save(flags);
+		ptp_read_system_prets(sts);
+		/* Order the system timestamp before the relaxed command write. */
+		mb();
+	}
+	macb_writel(bp, MAN, cmd);
+	if (sts) {
+		/* Flush the posted write before taking the upper bound. */
+		macb_readl(bp, NSR);
+		/* Order the read-back before the system timestamp. */
+		rmb();
+		ptp_read_system_postts(sts);
+		local_irq_restore(flags);
+
+		ptp_system_timestamp_add_ns(sts, bp->mdio_write_pre_ns,
+					    bp->mdio_write_post_ns);
+	}
 
 	status = macb_mdio_wait_for_idle(bp);
 	if (status < 0)
@@ -446,6 +466,12 @@ mdio_write_exit:
 	pm_runtime_put_autosuspend(&bp->pdev->dev);
 mdio_pm_exit:
 	return status;
+}
+
+static int macb_mdio_write_c22(struct mii_bus *bus, int mii_id, int regnum,
+			       u16 value)
+{
+	return macb_mdio_write_c22_sts(bus, mii_id, regnum, value, NULL);
 }
 
 static int macb_mdio_write_c45(struct mii_bus *bus, int mii_id,
@@ -1150,6 +1176,34 @@ static int macb_mdiobus_register(struct macb *bp, struct device_node *mdio_np)
 	return mdiobus_register(bp->mii_bus);
 }
 
+static void macb_mdio_init_sts(struct macb *bp)
+{
+	static const u16 gem_divisors[] = { 8, 16, 32, 48, 64, 96, 128, 224 };
+	static const u16 macb_divisors[] = { 8, 16, 32, 64 };
+	unsigned long rate = clk_get_rate(bp->pclk);
+	u32 config = macb_readl(bp, NCFGR);
+	u64 period_numerator;
+	u32 divisor;
+
+	if (!rate)
+		return;
+
+	if (macb_is_gem(bp))
+		divisor = gem_divisors[GEM_BFEXT(CLK, config)];
+	else
+		divisor = macb_divisors[MACB_BFEXT(CLK, config)];
+
+	/* A full-preamble clause 22 write samples D0 after 63..65 MDC
+	 * periods from the command write, including engine start phase.
+	 * Round the lower bound down and the upper bound up.
+	 */
+	period_numerator = (u64)divisor * NSEC_PER_SEC;
+	bp->mdio_write_pre_ns = div64_u64(63 * period_numerator, rate);
+	bp->mdio_write_post_ns = div64_u64(65 * period_numerator + rate - 1,
+					   rate);
+	bp->mii_bus->write_sts = macb_mdio_write_c22_sts;
+}
+
 static int macb_mii_init(struct macb *bp)
 {
 	struct device_node *mdio_np, *np = bp->pdev->dev.of_node;
@@ -1182,6 +1236,7 @@ static int macb_mii_init(struct macb *bp)
 		 bp->pdev->name, bp->pdev->id);
 	bp->mii_bus->priv = bp;
 	bp->mii_bus->parent = &bp->pdev->dev;
+	macb_mdio_init_sts(bp);
 
 	dev_set_drvdata(&bp->dev->dev, bp->mii_bus);
 
