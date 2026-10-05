@@ -214,6 +214,24 @@ static void bcm_ptp_framesync(struct phy_device *phydev, u16 ctrl)
 	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_CPU_FRAMESYNC);
 }
 
+static int bcm_ptp_framesync_sts(struct phy_device *phydev, u16 ctrl,
+				 struct ptp_system_timestamp *sts)
+{
+	int err;
+
+	/* Keep the selector and data writes together, but timestamp
+	 * only the data frame that triggers framesync.
+	 */
+	phy_lock_mdio_bus(phydev);
+	err = __phy_write(phydev, MII_BCM54XX_EXP_SEL, NSE_CTRL);
+	if (!err)
+		err = __phy_write_sts(phydev, MII_BCM54XX_EXP_DATA,
+				      ctrl | NSE_CPU_FRAMESYNC, sts);
+	phy_unlock_mdio_bus(phydev);
+
+	return err;
+}
+
 static int bcm_ptp_framesync_ts(struct phy_device *phydev,
 				struct ptp_system_timestamp *sts,
 				struct timespec64 *ts,
@@ -224,12 +242,20 @@ static int bcm_ptp_framesync_ts(struct phy_device *phydev,
 
 	ctrl = bcm_ptp_framesync_disable(phydev, orig_ctrl);
 
-	ptp_read_system_prets(sts);
+	if (sts && phydev->mdio.bus->write_sts) {
+		int err;
 
-	/* trigger framesync + capture */
-	bcm_ptp_framesync(phydev, ctrl | NSE_CAPTURE_EN);
-
-	ptp_read_system_postts(sts);
+		err = bcm_ptp_framesync_sts(phydev, ctrl | NSE_CAPTURE_EN, sts);
+		if (err) {
+			bcm_ptp_framesync_restore(phydev, orig_ctrl);
+			return err;
+		}
+	} else {
+		/* Preserve the existing path on buses without write_sts. */
+		ptp_read_system_prets(sts);
+		bcm_ptp_framesync(phydev, ctrl | NSE_CAPTURE_EN);
+		ptp_read_system_postts(sts);
+	}
 
 	/* poll for FSYNC interrupt from TS capture */
 	for (i = 0; i < 10; i++) {
