@@ -497,6 +497,43 @@ int __mdiobus_write(struct mii_bus *bus, int addr, u32 regnum, u16 val)
 EXPORT_SYMBOL(__mdiobus_write);
 
 /**
+ * __mdiobus_write_sts - Write a clause 22 register with a frame-end timestamp
+ * @bus: the mii_bus struct
+ * @addr: the PHY address
+ * @regnum: clause 22 register number
+ * @val: value to write
+ * @sts: system timestamp bounds, or NULL for an ordinary write
+ *
+ * Caller must hold the MDIO bus lock. May sleep. Returns -EOPNOTSUPP if
+ * timestamping is requested but the bus has no write_sts operation.
+ */
+int __mdiobus_write_sts(struct mii_bus *bus, int addr, u32 regnum, u16 val,
+			struct ptp_system_timestamp *sts)
+{
+	int err;
+
+	lockdep_assert_held_once(&bus->mdio_lock);
+
+	if (addr < 0 || addr >= PHY_MAX_ADDR)
+		return -ENXIO;
+	if (regnum > 0x1f)
+		return -EINVAL;
+	if (!sts)
+		return __mdiobus_write(bus, addr, regnum, val);
+
+	if (bus->write_sts)
+		err = bus->write_sts(bus, addr, regnum, val, sts);
+	else
+		err = -EOPNOTSUPP;
+
+	trace_mdio_access(bus, 0, addr, regnum, val, err);
+	mdiobus_stats_acct(&bus->stats[addr], false, err);
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(__mdiobus_write_sts);
+
+/**
  * __mdiobus_modify_changed - Unlocked version of the mdiobus_modify function
  * @bus: the mii_bus struct
  * @addr: the phy address
