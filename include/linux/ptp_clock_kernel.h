@@ -519,4 +519,20 @@ static inline void ptp_read_system_postts(struct ptp_system_timestamp *sts)
 		ktime_get_clock_ts64(sts->clockid, &sts->post_ts);
 }
 
+/**
+ * ptp_system_timestamp_add_ns - Shift the bounds of a system timestamp
+ * @sts: timestamp to shift, or NULL
+ * @pre_ns: delay to add to the lower bound, in nanoseconds
+ * @post_ns: delay to add to the upper bound, in nanoseconds
+ */
+static inline void ptp_system_timestamp_add_ns(struct ptp_system_timestamp *sts,
+					       u64 pre_ns, u64 post_ns)
+{
+	if (!sts)
+		return;
+
+	timespec64_add_ns(&sts->pre_ts, pre_ns);
+	timespec64_add_ns(&sts->post_ts, post_ns);
+}
+
 #endif
