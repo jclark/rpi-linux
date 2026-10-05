@@ -174,44 +174,63 @@ static struct bcm_ptp_private *ptp2priv(struct ptp_clock_info *info)
 	return container_of(info, struct bcm_ptp_private, ptp_info);
 }
 
-static void bcm_ptp_get_framesync_ts(struct phy_device *phydev,
-				     struct timespec64 *ts)
+static int bcm_ptp_get_framesync_ts(struct phy_device *phydev,
+				    struct timespec64 *ts)
 {
+	static const u16 regs[] = { HB_REG_0, HB_REG_1, HB_REG_2, HB_REG_3 };
+	int err, ret, i;
 	u16 hb[4];
 
-	bcm_phy_write_exp(phydev, HB_STAT_CTRL, HB_READ_START);
+	err = bcm_phy_write_exp(phydev, HB_STAT_CTRL, HB_READ_START);
+	if (err)
+		goto out;
 
-	hb[0] = bcm_phy_read_exp(phydev, HB_REG_0);
-	hb[1] = bcm_phy_read_exp(phydev, HB_REG_1);
-	hb[2] = bcm_phy_read_exp(phydev, HB_REG_2);
-	hb[3] = bcm_phy_read_exp(phydev, HB_REG_3);
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		ret = bcm_phy_read_exp(phydev, regs[i]);
+		if (ret < 0) {
+			err = ret;
+			goto out;
+		}
+		hb[i] = ret;
+	}
+out:
+	ret = bcm_phy_write_exp(phydev, HB_STAT_CTRL, HB_READ_END);
+	if (!err)
+		err = ret;
+	ret = bcm_phy_write_exp(phydev, HB_STAT_CTRL, 0);
+	if (!err)
+		err = ret;
+	if (err)
+		return err;
 
-	bcm_phy_write_exp(phydev, HB_STAT_CTRL, HB_READ_END);
-	bcm_phy_write_exp(phydev, HB_STAT_CTRL, 0);
+	ts->tv_sec = ((u32)hb[3] << 16) | hb[2];
+	ts->tv_nsec = ((u32)hb[1] << 16) | hb[0];
 
-	ts->tv_sec = (hb[3] << 16) | hb[2];
-	ts->tv_nsec = (hb[1] << 16) | hb[0];
+	return 0;
 }
 
-static u16 bcm_ptp_framesync_disable(struct phy_device *phydev, u16 orig_ctrl)
+static int bcm_ptp_framesync_disable(struct phy_device *phydev, u16 orig_ctrl)
 {
 	u16 ctrl = orig_ctrl & ~(NSE_FRAMESYNC_MASK | NSE_CAPTURE_EN);
+	int err;
 
-	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
+	err = bcm_phy_write_exp(phydev, NSE_CTRL, ctrl);
 
-	return ctrl;
+	return err ? err : ctrl;
 }
 
-static void bcm_ptp_framesync_restore(struct phy_device *phydev, u16 orig_ctrl)
+static int bcm_ptp_framesync_restore(struct phy_device *phydev, u16 orig_ctrl)
 {
 	if (orig_ctrl & NSE_FRAMESYNC_MASK)
-		bcm_phy_write_exp(phydev, NSE_CTRL, orig_ctrl);
+		return bcm_phy_write_exp(phydev, NSE_CTRL, orig_ctrl);
+
+	return 0;
 }
 
-static void bcm_ptp_framesync(struct phy_device *phydev, u16 ctrl)
+static int bcm_ptp_framesync(struct phy_device *phydev, u16 ctrl)
 {
 	/* trigger framesync - must have 0->1 transition. */
-	bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_CPU_FRAMESYNC);
+	return bcm_phy_write_exp(phydev, NSE_CTRL, ctrl | NSE_CPU_FRAMESYNC);
 }
 
 static int bcm_ptp_framesync_sts(struct phy_device *phydev, u16 ctrl,
@@ -237,38 +256,41 @@ static int bcm_ptp_framesync_ts(struct phy_device *phydev,
 				struct timespec64 *ts,
 				u16 orig_ctrl)
 {
-	u16 ctrl, reg;
-	int i;
+	int ctrl, reg, err, ret, i;
 
 	ctrl = bcm_ptp_framesync_disable(phydev, orig_ctrl);
+	if (ctrl < 0) {
+		err = ctrl;
+		goto out;
+	}
 
 	if (sts && phydev->mdio.bus->write_sts) {
-		int err;
-
 		err = bcm_ptp_framesync_sts(phydev, ctrl | NSE_CAPTURE_EN, sts);
-		if (err) {
-			bcm_ptp_framesync_restore(phydev, orig_ctrl);
-			return err;
-		}
 	} else {
-		/* Preserve the existing path on buses without write_sts. */
 		ptp_read_system_prets(sts);
-		bcm_ptp_framesync(phydev, ctrl | NSE_CAPTURE_EN);
+		err = bcm_ptp_framesync(phydev, ctrl | NSE_CAPTURE_EN);
 		ptp_read_system_postts(sts);
 	}
+	if (err)
+		goto out;
 
 	/* poll for FSYNC interrupt from TS capture */
 	for (i = 0; i < 10; i++) {
 		reg = bcm_phy_read_exp(phydev, INTR_STATUS);
+		if (reg < 0) {
+			err = reg;
+			goto out;
+		}
 		if (reg & INTC_FSYNC) {
-			bcm_ptp_get_framesync_ts(phydev, ts);
-			break;
+			err = bcm_ptp_get_framesync_ts(phydev, ts);
+			goto out;
 		}
 	}
+	err = -ETIMEDOUT;
+out:
+	ret = bcm_ptp_framesync_restore(phydev, orig_ctrl);
 
-	bcm_ptp_framesync_restore(phydev, orig_ctrl);
-
-	return reg & INTC_FSYNC ? 0 : -ETIMEDOUT;
+	return err ? err : ret;
 }
 
 static int bcm_ptp_gettimex(struct ptp_clock_info *info,
@@ -289,33 +311,60 @@ static int bcm_ptp_settime_locked(struct bcm_ptp_private *priv,
 				  const struct timespec64 *ts)
 {
 	struct phy_device *phydev = priv->phydev;
-	u16 ctrl;
+	int ctrl, err, ret;
 	u64 ns;
 
 	ctrl = bcm_ptp_framesync_disable(phydev, priv->nse_ctrl);
+	if (ctrl < 0) {
+		err = ctrl;
+		goto out;
+	}
 
 	/* set up time code */
-	bcm_phy_write_exp(phydev, TIME_CODE_0, ts->tv_nsec);
-	bcm_phy_write_exp(phydev, TIME_CODE_1, ts->tv_nsec >> 16);
-	bcm_phy_write_exp(phydev, TIME_CODE_2, ts->tv_sec);
-	bcm_phy_write_exp(phydev, TIME_CODE_3, ts->tv_sec >> 16);
-	bcm_phy_write_exp(phydev, TIME_CODE_4, ts->tv_sec >> 32);
+	err = bcm_phy_write_exp(phydev, TIME_CODE_0, ts->tv_nsec);
+	if (err)
+		goto out;
+	err = bcm_phy_write_exp(phydev, TIME_CODE_1, ts->tv_nsec >> 16);
+	if (err)
+		goto out;
+	err = bcm_phy_write_exp(phydev, TIME_CODE_2, ts->tv_sec);
+	if (err)
+		goto out;
+	err = bcm_phy_write_exp(phydev, TIME_CODE_3, ts->tv_sec >> 16);
+	if (err)
+		goto out;
+	err = bcm_phy_write_exp(phydev, TIME_CODE_4, ts->tv_sec >> 32);
+	if (err)
+		goto out;
 
 	/* set NCO counter to match */
 	ns = timespec64_to_ns(ts);
-	bcm_phy_write_exp(phydev, NCO_TIME_0, ns >> 4);
-	bcm_phy_write_exp(phydev, NCO_TIME_1, ns >> 20);
-	bcm_phy_write_exp(phydev, NCO_TIME_2_CTRL, (ns >> 36) & 0xfff);
+	err = bcm_phy_write_exp(phydev, NCO_TIME_0, ns >> 4);
+	if (err)
+		goto out;
+	err = bcm_phy_write_exp(phydev, NCO_TIME_1, ns >> 20);
+	if (err)
+		goto out;
+	err = bcm_phy_write_exp(phydev, NCO_TIME_2_CTRL, (ns >> 36) & 0xfff);
+	if (err)
+		goto out;
 
 	/* set up load on next frame sync (auto-clears due to NSE_INIT) */
-	bcm_phy_write_exp(phydev, SHADOW_LOAD, TIME_CODE_LOAD | NCO_TIME_LOAD);
+	err = bcm_phy_write_exp(phydev, SHADOW_LOAD, TIME_CODE_LOAD | NCO_TIME_LOAD);
+	if (err)
+		goto clear_load;
 
 	/* must have NSE_INIT in order to write time code */
-	bcm_ptp_framesync(phydev, ctrl | NSE_INIT);
+	err = bcm_ptp_framesync(phydev, ctrl | NSE_INIT);
+	if (!err)
+		goto out;
+clear_load:
+	/* Do not leave a load pending after a failed framesync. */
+	bcm_phy_write_exp(phydev, SHADOW_LOAD, 0);
+out:
+	ret = bcm_ptp_framesync_restore(phydev, priv->nse_ctrl);
 
-	bcm_ptp_framesync_restore(phydev, priv->nse_ctrl);
-
-	return 0;
+	return err ? err : ret;
 }
 
 static int bcm_ptp_settime(struct ptp_clock_info *info,
@@ -371,8 +420,8 @@ static int bcm_ptp_adjfine(struct ptp_clock_info *info, long scaled_ppm)
 {
 	struct bcm_ptp_private *priv = ptp2priv(info);
 	int neg_adj = 0;
+	int ctrl, err, ret;
 	u32 diff, freq;
-	u16 ctrl;
 	u64 adj;
 
 	if (scaled_ppm < 0) {
@@ -387,25 +436,41 @@ static int bcm_ptp_adjfine(struct ptp_clock_info *info, long scaled_ppm)
 	mutex_lock(&priv->mutex);
 
 	ctrl = bcm_ptp_framesync_disable(priv->phydev, priv->nse_ctrl);
+	if (ctrl < 0) {
+		err = ctrl;
+		goto out;
+	}
 
-	bcm_phy_write_exp(priv->phydev, NCO_FREQ_LSB, freq);
-	bcm_phy_write_exp(priv->phydev, NCO_FREQ_MSB, freq >> 16);
+	err = bcm_phy_write_exp(priv->phydev, NCO_FREQ_LSB, freq);
+	if (err)
+		goto out;
+	err = bcm_phy_write_exp(priv->phydev, NCO_FREQ_MSB, freq >> 16);
+	if (err)
+		goto out;
 
-	bcm_phy_write_exp(priv->phydev, NCO_TIME_2_CTRL, FREQ_MDIO_SEL);
+	err = bcm_phy_write_exp(priv->phydev, NCO_TIME_2_CTRL, FREQ_MDIO_SEL);
+	if (err)
+		goto out;
 
 	/* load on next framesync */
-	bcm_phy_write_exp(priv->phydev, SHADOW_LOAD, FREQ_LOAD);
+	err = bcm_phy_write_exp(priv->phydev, SHADOW_LOAD, FREQ_LOAD);
+	if (err)
+		goto clear_load;
 
-	bcm_ptp_framesync(priv->phydev, ctrl);
+	err = bcm_ptp_framesync(priv->phydev, ctrl);
 
-	/* clear load */
-	bcm_phy_write_exp(priv->phydev, SHADOW_LOAD, 0);
-
-	bcm_ptp_framesync_restore(priv->phydev, priv->nse_ctrl);
+clear_load:
+	ret = bcm_phy_write_exp(priv->phydev, SHADOW_LOAD, 0);
+	if (!err)
+		err = ret;
+out:
+	ret = bcm_ptp_framesync_restore(priv->phydev, priv->nse_ctrl);
+	if (!err)
+		err = ret;
 
 	mutex_unlock(&priv->mutex);
 
-	return 0;
+	return err;
 }
 
 static bool bcm_ptp_rxtstamp(struct mii_timestamper *mii_ts,
@@ -565,8 +630,8 @@ static void bcm_ptp_perout_work(struct work_struct *pin_work)
 		container_of(pin_work, struct bcm_ptp_private, pin_work.work);
 	struct phy_device *phydev = priv->phydev;
 	struct timespec64 ts;
-	u64 ns, next;
-	u16 ctrl;
+	int ctrl, err, ret;
+	u64 ns, next = 0;
 
 	mutex_lock(&priv->mutex);
 
@@ -576,7 +641,9 @@ static void bcm_ptp_perout_work(struct work_struct *pin_work)
 		return;
 	}
 
-	bcm_ptp_framesync_ts(phydev, NULL, &ts, priv->nse_ctrl);
+	err = bcm_ptp_framesync_ts(phydev, NULL, &ts, priv->nse_ctrl);
+	if (err)
+		goto out;
 
 	/* this is 1PPS only */
 	next = NSEC_PER_SEC - ts.tv_nsec;
@@ -588,23 +655,46 @@ static void bcm_ptp_perout_work(struct work_struct *pin_work)
 	/* force 0->1 transition for ONESHOT */
 	ctrl = bcm_ptp_framesync_disable(phydev,
 					 priv->nse_ctrl & ~NSE_ONESHOT_EN);
+	if (ctrl < 0) {
+		err = ctrl;
+		goto restore;
+	}
 
-	bcm_phy_write_exp(phydev, SYNOUT_TS_0, ns & 0xfff0);
-	bcm_phy_write_exp(phydev, SYNOUT_TS_1, ns >> 16);
-	bcm_phy_write_exp(phydev, SYNOUT_TS_2, ns >> 32);
+	err = bcm_phy_write_exp(phydev, SYNOUT_TS_0, ns & 0xfff0);
+	if (err)
+		goto restore;
+	err = bcm_phy_write_exp(phydev, SYNOUT_TS_1, ns >> 16);
+	if (err)
+		goto restore;
+	err = bcm_phy_write_exp(phydev, SYNOUT_TS_2, ns >> 32);
+	if (err)
+		goto restore;
 
 	/* load values on next framesync */
-	bcm_phy_write_exp(phydev, SHADOW_LOAD, SYNC_OUT_LOAD);
+	err = bcm_phy_write_exp(phydev, SHADOW_LOAD, SYNC_OUT_LOAD);
+	if (err)
+		goto clear_load;
 
-	bcm_ptp_framesync(phydev, ctrl | NSE_ONESHOT_EN | NSE_INIT);
+	err = bcm_ptp_framesync(phydev, ctrl | NSE_ONESHOT_EN | NSE_INIT);
+	if (err)
+		goto clear_load;
 
 	priv->nse_ctrl |= NSE_ONESHOT_EN;
-	bcm_ptp_framesync_restore(phydev, priv->nse_ctrl);
+	goto restore;
+clear_load:
+	bcm_phy_write_exp(phydev, SHADOW_LOAD, 0);
+restore:
+	ret = bcm_ptp_framesync_restore(phydev, priv->nse_ctrl);
+	if (!err)
+		err = ret;
+out:
+	if (err)
+		dev_err_ratelimited(&phydev->mdio.dev, "PTP perout failed: %d\n", err);
 
 	mutex_unlock(&priv->mutex);
 
 	next = next + NSEC_PER_MSEC;
-	schedule_delayed_work(&priv->pin_work, nsecs_to_jiffies(next));
+	schedule_delayed_work(&priv->pin_work, err ? HZ : nsecs_to_jiffies(next));
 }
 
 static int bcm_ptp_perout_locked(struct bcm_ptp_private *priv,
@@ -659,7 +749,7 @@ static void bcm_ptp_extts_work(struct work_struct *pin_work)
 	struct phy_device *phydev = priv->phydev;
 	struct ptp_clock_event event;
 	struct timespec64 ts;
-	u16 reg;
+	int reg, err;
 
 	mutex_lock(&priv->mutex);
 
@@ -670,10 +760,12 @@ static void bcm_ptp_extts_work(struct work_struct *pin_work)
 	}
 
 	reg = bcm_phy_read_exp(phydev, INTR_STATUS);
-	if ((reg & INTC_FSYNC) == 0)
+	if (reg < 0 || !(reg & INTC_FSYNC))
 		goto out;
 
-	bcm_ptp_get_framesync_ts(phydev, &ts);
+	err = bcm_ptp_get_framesync_ts(phydev, &ts);
+	if (err)
+		goto out;
 
 	event.index = 0;
 	event.type = PTP_CLOCK_EXTTS;
@@ -688,24 +780,34 @@ out:
 static int bcm_ptp_extts_locked(struct bcm_ptp_private *priv, int on)
 {
 	struct phy_device *phydev = priv->phydev;
+	u16 ctrl;
+	int err;
 
 	if (!on)
 		return bcm_ptp_cancel_func(priv);
 
+	err = bcm_ptp_framesync_disable(phydev, priv->nse_ctrl);
+	if (err < 0)
+		goto restore;
+
+	ctrl = priv->nse_ctrl | NSE_SYNC1_FRAMESYNC | NSE_CAPTURE_EN;
+	err = bcm_ptp_framesync_restore(phydev, ctrl);
+	if (err)
+		goto restore;
+
 	if (priv->pin_active)
 		cancel_delayed_work_sync(&priv->pin_work);
 
-	bcm_ptp_framesync_disable(phydev, priv->nse_ctrl);
-
-	priv->nse_ctrl |= NSE_SYNC1_FRAMESYNC | NSE_CAPTURE_EN;
-
-	bcm_ptp_framesync_restore(phydev, priv->nse_ctrl);
-
+	priv->nse_ctrl = ctrl;
 	priv->pin_active = true;
 	INIT_DELAYED_WORK(&priv->pin_work, bcm_ptp_extts_work);
 	schedule_delayed_work(&priv->pin_work, 0);
 
 	return 0;
+restore:
+	bcm_ptp_framesync_restore(phydev, priv->nse_ctrl);
+
+	return err;
 }
 
 static int bcm_ptp_enable(struct ptp_clock_info *info,
