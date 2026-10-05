@@ -9,6 +9,7 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_mdio.h>
@@ -16,6 +17,7 @@
 #include <linux/phy.h>
 #include <linux/platform_data/mdio-bcm-unimac.h>
 #include <linux/platform_device.h>
+#include <linux/ptp_clock_kernel.h>
 #include <linux/sched.h>
 
 #define MDIO_CMD		0x00
@@ -42,6 +44,7 @@ struct unimac_mdio_priv {
 	void			*wait_func_data;
 	struct clk		*clk;
 	u32			clk_freq;
+	unsigned long		mdio_ref_rate;
 };
 
 static inline u32 unimac_mdio_readl(struct unimac_mdio_priv *priv, u32 offset)
@@ -127,28 +130,73 @@ out:
 	return ret;
 }
 
-static int unimac_mdio_write(struct mii_bus *bus, int phy_id,
-			     int reg, u16 val)
+static int unimac_mdio_write_sts(struct mii_bus *bus, int phy_id, int reg,
+				 u16 val, struct ptp_system_timestamp *sts)
 {
 	struct unimac_mdio_priv *priv = bus->priv;
-	u32 cmd;
+	unsigned long flags;
+	u64 pre_ns = 0, post_ns = 0, period_numerator;
+	u32 cmd, config, divisor;
 	int ret;
 
 	ret = clk_prepare_enable(priv->clk);
 	if (ret)
 		return ret;
 
+	if (sts) {
+		config = unimac_mdio_readl(priv, MDIO_CFG);
+		if (!(config & MDIO_C22) || (config & MDIO_SUPP_PREAMBLE)) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		divisor = 2 * (((config >> MDIO_CLK_DIV_SHIFT) &
+				MDIO_CLK_DIV_MASK) + 1);
+		period_numerator = (u64)divisor * NSEC_PER_SEC;
+		/* Bound the final data bit, including engine start phase. */
+		pre_ns = div64_u64(63 * period_numerator, priv->mdio_ref_rate);
+		post_ns = div64_u64(65 * period_numerator +
+				   priv->mdio_ref_rate - 1, priv->mdio_ref_rate);
+	}
+
 	/* Prepare the write operation */
 	cmd = MDIO_WR | (phy_id << MDIO_PMD_SHIFT) |
 		(reg << MDIO_REG_SHIFT) | (0xffff & val);
 	unimac_mdio_writel(priv, cmd, MDIO_CMD);
 
-	unimac_mdio_start(priv);
+	if (sts) {
+		/* Only the write setting START_BUSY starts the frame. */
+		cmd = unimac_mdio_readl(priv, MDIO_CMD) | MDIO_START_BUSY;
+		local_irq_save(flags);
+		ptp_read_system_prets(sts);
+		/* Order the timestamp before the relaxed command write. */
+		mb();
+		unimac_mdio_writel(priv, cmd, MDIO_CMD);
+		/* Flush the posted command write. */
+		unimac_mdio_readl(priv, MDIO_CMD);
+		/* Order the read-back before the system timestamp. */
+		rmb();
+		ptp_read_system_postts(sts);
+		local_irq_restore(flags);
+		ptp_system_timestamp_add_ns(sts, pre_ns, post_ns);
+	} else {
+		unimac_mdio_start(priv);
+	}
 
 	ret = priv->wait_func(priv->wait_func_data);
+	/* Some wait callbacks do not propagate a completion timeout. */
+	if (!ret && sts &&
+	    (unimac_mdio_readl(priv, MDIO_CMD) & MDIO_START_BUSY))
+		ret = -ETIMEDOUT;
+out:
 	clk_disable_unprepare(priv->clk);
 
 	return ret;
+}
+
+static int unimac_mdio_write(struct mii_bus *bus, int phy_id,
+			     int reg, u16 val)
+{
+	return unimac_mdio_write_sts(bus, phy_id, reg, val, NULL);
 }
 
 /* Workaround for integrated BCM7xxx Gigabit PHYs which have a problem with
@@ -298,6 +346,18 @@ static int unimac_mdio_probe(struct platform_device *pdev)
 	ret = unimac_mdio_clk_set(priv);
 	if (ret)
 		goto out_mdio_free;
+
+	priv->mdio_ref_rate = clk_get_rate(priv->clk);
+	/* BCM2711 does not describe the GENET reference clock in DT yet.
+	 * Divider tests on CM4 measure a 200 MHz reference. Use that only
+	 * for this integration, pending a clock-provider description.
+	 */
+	if (!priv->mdio_ref_rate && pdev->dev.parent &&
+	    of_device_is_compatible(pdev->dev.parent->of_node,
+				    "brcm,bcm2711-genet-v5"))
+		priv->mdio_ref_rate = 200000000;
+	if (priv->mdio_ref_rate)
+		bus->write_sts = unimac_mdio_write_sts;
 
 	ret = of_mdiobus_register(bus, np);
 	if (ret) {
